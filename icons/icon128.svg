@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <!-- disc: lit from upper-left -->
+    <radialGradient id="bg" cx="38%" cy="32%" r="80%">
+      <stop offset="0%"   stop-color="#494c62"/>
+      <stop offset="100%" stop-color="#1a1a2a"/>
+    </radialGradient>
+    <!-- front chevron: lavender → blue → sky -->
+    <linearGradient id="chev" x1="98" y1="14" x2="60" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#b4befe"/>
+      <stop offset="50%"  stop-color="#89b4fa"/>
+      <stop offset="100%" stop-color="#74c7ec"/>
+    </linearGradient>
+    <!-- clip so the glow can't bleed outside the disc -->
+    <clipPath id="clip">
+      <circle cx="64" cy="64" r="63"/>
+    </clipPath>
+  </defs>
+
+  <!-- gradient background disc -->
+  <circle cx="64" cy="64" r="64" fill="url(#bg)"/>
+
+  <!-- outer definition ring -->
+  <circle cx="64" cy="64" r="62"   fill="none" stroke="#ffffff" stroke-width="1.5" opacity="0.14"/>
+  <!-- inner accent ring -->
+  <circle cx="64" cy="64" r="58.5" fill="none" stroke="#89b4fa" stroke-width="2"   opacity="0.55"/>
+
+  <!-- back chevron -->
+  <polyline points="66,14 28,64 66,114"
+            fill="none" stroke="#585b70" stroke-width="13"
+            stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- front chevron glow (clipped to disc) -->
+  <polyline points="98,14 60,64 98,114"
+            fill="none" stroke="#89b4fa" stroke-width="26"
+            stroke-linecap="round" stroke-linejoin="round"
+            opacity="0.14" clip-path="url(#clip)"/>
+
+  <!-- front chevron gradient -->
+  <polyline points="98,14 60,64 98,114"
+            fill="none" stroke="url(#chev)" stroke-width="13"
+            stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- subtle specular shine at top of disc -->
+  <ellipse cx="50" cy="26" rx="22" ry="10"
+           fill="white" opacity="0.055"
+           transform="rotate(-25 50 26)"/>
+</svg>

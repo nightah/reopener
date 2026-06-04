@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Reopener Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="container">
+    <div class="page-header">
+      <img src="icons/icon48.svg" class="page-icon" alt="">
+      <h1>Reopener Settings</h1>
+    </div>
+
+    <div class="field">
+      <label>Appearance</label>
+      <p class="hint">Choose a theme, or follow your OS setting.</p>
+      <div class="seg-control">
+        <button class="seg-btn" data-value="light">Light</button>
+        <button class="seg-btn" data-value="auto">Auto</button>
+        <button class="seg-btn" data-value="dark">Dark</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="max-tabs">Maximum closed tabs to remember</label>
+      <p class="hint">Higher values use more browser storage. Default: 9999.</p>
+      <input type="number" id="max-tabs" min="1" max="99999" step="1">
+    </div>
+
+    <div class="actions">
+      <button id="btn-save">Save</button>
+      <button id="btn-clear" class="danger">Clear history</button>
+    </div>
+
+    <p id="status" class="status hidden"></p>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>
