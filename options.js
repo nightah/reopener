@@ -1,4 +1,5 @@
 const DEFAULT_MAX_TABS = 9999;
+const DEFAULT_EXPAND_THRESHOLD = 10;
 
 function showStatus(msg, isError = false) {
   const el = document.getElementById('status');
@@ -16,7 +17,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // ── Theme toggle ──────────────────────────────────────────
-  const { theme = 'dark' } = await browser.storage.local.get('theme');
+  const { theme = 'auto' } = await browser.storage.local.get('theme');
   localStorage.setItem('reopener-theme', theme);
   applyTheme(theme);
   mq.addEventListener('change', () => { if (currentTheme === 'auto') applyTheme('auto'); });
@@ -32,6 +33,31 @@ document.addEventListener('DOMContentLoaded', async () => {
         b.classList.toggle('active', b === btn));
       applyTheme(currentTheme);
     });
+  });
+
+  // ── Window groups ─────────────────────────────────────────
+  const expandToggle = document.getElementById('expand-windows');
+  const thresholdInput = document.getElementById('expand-threshold');
+  const {
+    expandWindows = false,
+    expandThreshold = DEFAULT_EXPAND_THRESHOLD,
+  } = await browser.storage.local.get(['expandWindows', 'expandThreshold']);
+
+  expandToggle.checked = expandWindows;
+  thresholdInput.value = expandThreshold;
+  thresholdInput.disabled = !expandWindows;
+
+  expandToggle.addEventListener('change', async () => {
+    thresholdInput.disabled = !expandToggle.checked;
+    await browser.storage.local.set({ expandWindows: expandToggle.checked });
+    showStatus('Saved.');
+  });
+
+  thresholdInput.addEventListener('change', async () => {
+    const val = parseInt(thresholdInput.value, 10);
+    if (!val || val < 1) { showStatus('Enter a number greater than 0.', true); return; }
+    await browser.storage.local.set({ expandThreshold: val });
+    showStatus('Saved.');
   });
 
   // ── Max tabs ──────────────────────────────────────────────

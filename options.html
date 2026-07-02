@@ -23,6 +23,22 @@
     </div>
 
     <div class="field">
+      <label>Window groups</label>
+      <p class="hint">Closed windows are grouped. Choose whether they open expanded.</p>
+      <label class="switch">
+        <input type="checkbox" id="expand-windows">
+        <span class="slider"></span>
+        <span class="switch-label">Expand windows by default</span>
+      </label>
+    </div>
+
+    <div class="field">
+      <label for="expand-threshold">Auto-expand windows with up to this many tabs</label>
+      <p class="hint">Larger windows stay collapsed to reduce clutter. Only applies when the toggle above is on.</p>
+      <input type="number" id="expand-threshold" min="1" max="999" step="1">
+    </div>
+
+    <div class="field">
       <label for="max-tabs">Maximum closed tabs to remember</label>
       <p class="hint">Higher values use more browser storage. Default: 9999.</p>
       <input type="number" id="max-tabs" min="1" max="99999" step="1">

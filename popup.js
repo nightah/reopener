@@ -1,6 +1,6 @@
 // Apply theme synchronously before first paint to avoid flash
 (function () {
-  const t = localStorage.getItem('reopener-theme') || 'dark';
+  const t = localStorage.getItem('reopener-theme') || 'auto';
   const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
   document.documentElement.setAttribute('data-theme',
     t === 'auto' ? (dark ? 'dark' : 'light') : t);
@@ -8,9 +8,25 @@
 
 const DEFAULT_MAX_VISIBLE = 200;
 
-let allTabs = [];
-let filtered = [];
+let allEntries = [];              // array of {type:'tab',...} | {type:'window', tabs:[...]}
+const expanded = new Set();       // window entry object refs that are expanded
+let rows = [];                    // navigable rows for the current render: {el, activate, remove, toggle?}
 let selectedIndex = -1;
+
+// Right-click context menu state
+let menuEl = null;
+let ctxOnOpen = null;
+let ctxOnDelete = null;
+
+// Clear-history dropdown
+let clearMenuEl = null;
+
+function isWindow(entry) {
+  return entry && entry.type === 'window';
+}
+function tabCount(entry) {
+  return isWindow(entry) ? entry.tabs.length : 1;
+}
 
 function relativeTime(ts) {
   const s = Math.floor((Date.now() - ts) / 1000);
@@ -37,33 +53,58 @@ function fuzzyScore(query, title, url) {
   return 0;
 }
 
-function faviconSrc(tab) {
-  if (tab.favIconUrl) return tab.favIconUrl;
+function faviconSrc(item) {
+  if (item.favIconUrl) return item.favIconUrl;
   try {
-    const { hostname } = new URL(tab.url);
+    const { hostname } = new URL(item.url);
     return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=32`;
   } catch { return null; }
 }
 
-// Builds the SVG placeholder entirely via DOM — no innerHTML.
-function makePlaceholderEl() {
-  const span = document.createElement('span');
-  span.className = 'tab-favicon-placeholder';
+function svgEl(width, pathD) {
   const ns = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(ns, 'svg');
   svg.setAttribute('viewBox', '0 0 16 16');
   svg.setAttribute('fill', 'currentColor');
-  svg.setAttribute('width', '12');
-  svg.setAttribute('height', '12');
+  svg.setAttribute('width', String(width));
+  svg.setAttribute('height', String(width));
   const path = document.createElementNS(ns, 'path');
-  path.setAttribute('d', 'M2 2h12v12H2V2zm1 1v10h10V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7zm0 2h4v1H5V9z');
+  path.setAttribute('d', pathD);
   svg.appendChild(path);
-  span.appendChild(svg);
+  return svg;
+}
+
+function makePlaceholderEl() {
+  const span = document.createElement('span');
+  span.className = 'tab-favicon-placeholder';
+  span.appendChild(svgEl(12, 'M2 2h12v12H2V2zm1 1v10h10V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7zm0 2h4v1H5V9z'));
   return span;
 }
 
-function makeFaviconEl(tab) {
-  const src = faviconSrc(tab);
+function makeWindowIconEl() {
+  const span = document.createElement('span');
+  span.className = 'tab-favicon-placeholder';
+  // Stacked windows glyph
+  span.appendChild(svgEl(13, 'M3 1h10a1 1 0 011 1v8a1 1 0 01-1 1H3a1 1 0 01-1-1V2a1 1 0 011-1zm0 2v7h10V3H3zm-1 10h11a1 1 0 01-1 1H2a1 1 0 01-1-1V4a1 1 0 011 1z'));
+  return span;
+}
+
+function makeWindowBadgeEl(onClick) {
+  const span = document.createElement('span');
+  span.className = 'from-window';
+  span.setAttribute('role', 'button');
+  span.title = 'Restore the whole window';
+  span.appendChild(svgEl(10, 'M3 1h10a1 1 0 011 1v8a1 1 0 01-1 1H3a1 1 0 01-1-1V2a1 1 0 011-1zm0 2v7h10V3H3zm-1 10h11a1 1 0 01-1 1H2a1 1 0 01-1-1V4a1 1 0 011 1z'));
+  span.appendChild(document.createTextNode('Window'));
+  span.addEventListener('click', (e) => {
+    e.stopPropagation();   // don't trigger the row's single-tab restore
+    onClick();
+  });
+  return span;
+}
+
+function makeFaviconEl(item) {
+  const src = faviconSrc(item);
   if (!src) return makePlaceholderEl();
   const img = document.createElement('img');
   img.className = 'tab-favicon';
@@ -75,138 +116,356 @@ function makeFaviconEl(tab) {
 
 // Appends text to el with the matched portion wrapped in a <mark>.
 function appendHighlighted(el, text, query) {
-  if (!query) {
-    el.textContent = text;
-    return;
-  }
+  if (!query) { el.textContent = text; return; }
   const idx = text.toLowerCase().indexOf(query.toLowerCase());
-  if (idx !== -1) {
-    if (idx > 0) el.appendChild(document.createTextNode(text.slice(0, idx)));
-    const mark = document.createElement('mark');
-    mark.textContent = text.slice(idx, idx + query.length);
-    el.appendChild(mark);
-    if (idx + query.length < text.length) {
-      el.appendChild(document.createTextNode(text.slice(idx + query.length)));
-    }
-  } else {
-    el.textContent = text;
+  if (idx === -1) { el.textContent = text; return; }
+  if (idx > 0) el.appendChild(document.createTextNode(text.slice(0, idx)));
+  const mark = document.createElement('mark');
+  mark.textContent = text.slice(idx, idx + query.length);
+  el.appendChild(mark);
+  if (idx + query.length < text.length) {
+    el.appendChild(document.createTextNode(text.slice(idx + query.length)));
   }
 }
 
-function renderResults(query) {
+function saveEntries() {
+  return browser.storage.local.set({ closedTabs: allEntries });
+}
+
+// ── Restore actions ───────────────────────────────────────
+function restoreTab(url) {
+  browser.tabs.create({ url });
+  window.close();
+}
+
+function restoreWindow(entry) {
+  const urls = entry.tabs.map(t => t.url);
+  const n = urls.length;
+  if (!confirm(`Restore this window with ${n} tab${n === 1 ? '' : 's'}?`)) return;
+  browser.windows.create({ url: urls });
+  window.close();
+}
+
+// ── Deletion ──────────────────────────────────────────────
+async function removeEntry(entry) {
+  const i = allEntries.indexOf(entry);
+  if (i !== -1) allEntries.splice(i, 1);
+  expanded.delete(entry);
+  await saveEntries();
+}
+
+async function removeChildTab(entry, childIndex) {
+  entry.tabs.splice(childIndex, 1);
+  if (entry.tabs.length === 1) {
+    // Collapse a one-tab window group back into a plain tab entry.
+    const only = entry.tabs[0];
+    entry.type = 'tab';
+    entry.title = only.title;
+    entry.url = only.url;
+    entry.favIconUrl = only.favIconUrl;
+    delete entry.tabs;
+    expanded.delete(entry);
+  } else if (entry.tabs.length === 0) {
+    const i = allEntries.indexOf(entry);
+    if (i !== -1) allEntries.splice(i, 1);
+    expanded.delete(entry);
+  }
+  await saveEntries();
+}
+
+// ── Clear history ─────────────────────────────────────────
+async function clearSearched(query) {
   const q = (query || '').trim();
+  if (!q) return;
+  const matchCount = flatten().filter(it => fuzzyScore(q, it.title, it.url) > 0).length;
+  if (matchCount === 0) return;
+  if (!confirm(`Clear ${matchCount} matching tab${matchCount === 1 ? '' : 's'} from history?`)) return;
 
-  filtered = q
-    ? allTabs
-        .map(tab => ({ tab, score: fuzzyScore(q, tab.title, tab.url) }))
-        .filter(({ score }) => score > 0)
-        .sort((a, b) => b.score - a.score)
-        .map(({ tab }) => tab)
-    : allTabs.slice(0, DEFAULT_MAX_VISIBLE);
+  const next = [];
+  for (const e of allEntries) {
+    if (isWindow(e)) {
+      const kept = e.tabs.filter(t => fuzzyScore(q, t.title, t.url) === 0);
+      if (kept.length === e.tabs.length) next.push(e);
+      else if (kept.length === 1) next.push({ type: 'tab', ...kept[0], closedAt: e.closedAt });
+      else if (kept.length > 1) next.push({ ...e, tabs: kept });
+      // 0 kept → drop the group entirely
+    } else if (fuzzyScore(q, e.title, e.url) === 0) {
+      next.push(e);
+    }
+  }
+  allEntries = next;
+  await saveEntries();
+  document.getElementById('search').value = '';
+  rerender();
+}
 
+async function clearRecent(minutes) {
+  const cutoff = Date.now() - minutes * 60000;
+  const removedTabs = allEntries
+    .filter(e => e.closedAt >= cutoff)
+    .reduce((n, e) => n + tabCount(e), 0);
+  if (removedTabs === 0) { alert('No tabs were closed in that time range.'); return; }
+  if (!confirm(`Clear ${removedTabs} tab${removedTabs === 1 ? '' : 's'} closed in the last ${minutes} minute${minutes === 1 ? '' : 's'}?`)) return;
+  allEntries = allEntries.filter(e => e.closedAt < cutoff);
+  await saveEntries();
+  rerender();
+}
+
+async function clearAll() {
+  if (allEntries.length === 0) return;
+  if (!confirm('Clear all closed tab history? This cannot be undone.')) return;
+  allEntries = [];
+  await saveEntries();
+  rerender();
+}
+
+// ── Row builders ──────────────────────────────────────────
+function buildTabRow(item, query, { indented, activate, remove, fromWindow, onWindowRestore }) {
+  const el = document.createElement('div');
+  el.className = 'tab-item' + (indented ? ' child-tab' : '');
+  el.setAttribute('role', 'listitem');
+  el.setAttribute('tabindex', '-1');
+
+  el.appendChild(makeFaviconEl(item));
+
+  const body = document.createElement('div');
+  body.className = 'tab-body';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'tab-title';
+  appendHighlighted(titleEl, item.title, query);
+  const urlEl = document.createElement('div');
+  urlEl.className = 'tab-url';
+  appendHighlighted(urlEl, item.url, query);
+  body.appendChild(titleEl);
+  body.appendChild(urlEl);
+  el.appendChild(body);
+
+  if (fromWindow) el.appendChild(makeWindowBadgeEl(onWindowRestore));
+
+  const timeEl = document.createElement('span');
+  timeEl.className = 'tab-time';
+  timeEl.textContent = relativeTime(item.closedAt);
+  el.appendChild(timeEl);
+
+  el.addEventListener('click', activate);
+  el.addEventListener('contextmenu', e => showContextMenu(e, el, activate, remove));
+  rows.push({ el, activate, remove });
+  return el;
+}
+
+function buildWindowRow(entry, container) {
+  const el = document.createElement('div');
+  el.className = 'tab-item window-item';
+  el.setAttribute('role', 'listitem');
+  el.setAttribute('tabindex', '-1');
+
+  const isOpen = expanded.has(entry);
+
+  const toggle = document.createElement('span');
+  toggle.className = 'window-toggle';
+  toggle.textContent = isOpen ? '−' : '+';   // − / +
+  el.appendChild(toggle);
+
+  el.appendChild(makeWindowIconEl());
+
+  const body = document.createElement('div');
+  body.className = 'tab-body';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'tab-title window-title';
+  titleEl.textContent = 'Window';
+  const subEl = document.createElement('div');
+  subEl.className = 'window-sub';
+  subEl.textContent = `${entry.tabs.length} tabs`;
+  body.appendChild(titleEl);
+  body.appendChild(subEl);
+  el.appendChild(body);
+
+  const timeEl = document.createElement('span');
+  timeEl.className = 'tab-time';
+  timeEl.textContent = relativeTime(entry.closedAt);
+  el.appendChild(timeEl);
+
+  const doToggle = (e) => {
+    if (e) e.stopPropagation();
+    if (expanded.has(entry)) expanded.delete(entry); else expanded.add(entry);
+    render(document.getElementById('search').value);
+  };
+  const openWindow = () => restoreWindow(entry);
+  const deleteWindow = () => removeEntry(entry).then(rerender);
+  toggle.addEventListener('click', doToggle);
+  el.addEventListener('click', openWindow);
+  el.addEventListener('contextmenu', e => showContextMenu(e, el, openWindow, deleteWindow));
+
+  rows.push({ el, activate: openWindow, remove: deleteWindow, toggle: doToggle });
+  container.appendChild(el);
+
+  if (isOpen) {
+    entry.tabs.forEach((t, ti) => {
+      const item = { title: t.title, url: t.url, favIconUrl: t.favIconUrl, closedAt: entry.closedAt };
+      container.appendChild(buildTabRow(item, '', {
+        indented: true,
+        activate: () => restoreTab(t.url),
+        remove: () => removeChildTab(entry, ti).then(rerender),
+      }));
+    });
+  }
+}
+
+function rerender() {
+  render(document.getElementById('search').value);
+}
+
+// Flatten every stored tab (including those inside window groups) for search.
+function flatten() {
+  const out = [];
+  allEntries.forEach(entry => {
+    if (isWindow(entry)) {
+      entry.tabs.forEach((t, ti) => out.push({
+        title: t.title, url: t.url, favIconUrl: t.favIconUrl,
+        closedAt: entry.closedAt, entry, childIndex: ti,
+      }));
+    } else {
+      out.push({
+        title: entry.title, url: entry.url, favIconUrl: entry.favIconUrl,
+        closedAt: entry.closedAt, entry, childIndex: -1,
+      });
+    }
+  });
+  return out;
+}
+
+function render(query) {
+  const q = (query || '').trim();
   const resultsEl = document.getElementById('results');
   const emptyEl = document.getElementById('empty');
   const countEl = document.getElementById('count');
 
-  if (filtered.length === 0 && allTabs.length === 0) {
+  rows = [];
+  selectedIndex = -1;
+
+  const totalTabs = allEntries.reduce((n, e) => n + tabCount(e), 0);
+
+  if (allEntries.length === 0) {
     emptyEl.classList.remove('hidden');
     resultsEl.replaceChildren();
     countEl.textContent = '';
     return;
   }
-
   emptyEl.classList.add('hidden');
-
-  const total = allTabs.length;
-  countEl.textContent = q
-    ? `${filtered.length} of ${total}`
-    : total > DEFAULT_MAX_VISIBLE
-      ? `showing ${DEFAULT_MAX_VISIBLE} of ${total}`
-      : `${total}`;
 
   const fragment = document.createDocumentFragment();
 
-  filtered.forEach((tab, i) => {
-    const item = document.createElement('div');
-    item.className = 'tab-item';
-    item.setAttribute('role', 'listitem');
-    item.setAttribute('tabindex', '-1');
-    item.dataset.index = String(i);
-    item.dataset.url = tab.url;
+  if (q) {
+    // ── Search mode: flat list of matching tabs ──
+    const matches = flatten()
+      .map(item => ({ item, score: fuzzyScore(q, item.title, item.url) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, DEFAULT_MAX_VISIBLE)
+      .map(({ item }) => item);
 
-    item.appendChild(makeFaviconEl(tab));
+    countEl.textContent = `${matches.length} of ${totalTabs}`;
 
-    const body = document.createElement('div');
-    body.className = 'tab-body';
+    matches.forEach(item => {
+      fragment.appendChild(buildTabRow(item, q, {
+        indented: false,
+        fromWindow: item.childIndex >= 0,
+        onWindowRestore: () => restoreWindow(item.entry),
+        activate: () => restoreTab(item.url),
+        remove: () => (item.childIndex >= 0
+          ? removeChildTab(item.entry, item.childIndex)
+          : removeEntry(item.entry)).then(rerender),
+      }));
+    });
+  } else {
+    // ── Grouped chronological view ──
+    countEl.textContent = String(totalTabs);
 
-    const titleEl = document.createElement('div');
-    titleEl.className = 'tab-title';
-    appendHighlighted(titleEl, tab.title, q);
-
-    const urlEl = document.createElement('div');
-    urlEl.className = 'tab-url';
-    appendHighlighted(urlEl, tab.url, q);
-
-    body.appendChild(titleEl);
-    body.appendChild(urlEl);
-    item.appendChild(body);
-
-    const timeEl = document.createElement('span');
-    timeEl.className = 'tab-time';
-    timeEl.textContent = relativeTime(tab.closedAt);
-    item.appendChild(timeEl);
-
-    item.addEventListener('click', () => openTab(tab.url));
-    fragment.appendChild(item);
-  });
+    allEntries.slice(0, DEFAULT_MAX_VISIBLE).forEach(entry => {
+      if (isWindow(entry)) {
+        buildWindowRow(entry, fragment);
+      } else {
+        fragment.appendChild(buildTabRow(entry, '', {
+          indented: false,
+          activate: () => restoreTab(entry.url),
+          remove: () => removeEntry(entry).then(rerender),
+        }));
+      }
+    });
+  }
 
   resultsEl.replaceChildren(fragment);
-  selectedIndex = -1;
 
-  if (filtered.length > 0) {
+  if (rows.length > 0) {
     selectedIndex = 0;
-    resultsEl.firstElementChild.classList.add('selected');
+    rows[0].el.classList.add('selected');
   }
 }
 
-function openTab(url) {
-  browser.tabs.create({ url });
-  window.close();
+function hideContextMenu() {
+  if (menuEl) menuEl.classList.add('hidden');
 }
 
-async function deleteSelected() {
-  if (selectedIndex < 0 || !filtered[selectedIndex]) return;
+function hideClearMenu() {
+  if (clearMenuEl) clearMenuEl.classList.add('hidden');
+}
 
-  const keepIndex = selectedIndex;
-  allTabs.splice(allTabs.indexOf(filtered[selectedIndex]), 1);
-  await browser.storage.local.set({ closedTabs: allTabs });
+function hideMenus() {
+  hideContextMenu();
+  hideClearMenu();
+}
 
-  renderResults(document.getElementById('search').value);
+function openClearMenu(btn) {
+  hideContextMenu();
+  // "Clear searched" only makes sense with an active query.
+  document.getElementById('clear-searched').disabled = !document.getElementById('search').value.trim();
+  document.getElementById('clear-recent-form').classList.add('hidden');
+  clearMenuEl.classList.remove('hidden');
+  const r = btn.getBoundingClientRect();
+  const mr = clearMenuEl.getBoundingClientRect();
+  clearMenuEl.style.left = Math.max(4, r.right - mr.width) + 'px';
+  clearMenuEl.style.top = (r.bottom + 4) + 'px';
+}
 
-  if (filtered.length > 0 && keepIndex > 0) {
-    const newIndex = Math.min(keepIndex, filtered.length - 1);
-    const items = document.querySelectorAll('.tab-item');
-    items[0]?.classList.remove('selected');
-    items[newIndex]?.classList.add('selected');
-    items[newIndex]?.scrollIntoView({ block: 'nearest' });
-    selectedIndex = newIndex;
+function showContextMenu(e, el, onOpen, onDelete) {
+  e.preventDefault();
+  if (!menuEl) return;
+  hideClearMenu();
+
+  // Move selection to the right-clicked row
+  const idx = rows.findIndex(r => r.el === el);
+  if (idx >= 0) {
+    if (selectedIndex >= 0 && rows[selectedIndex]) rows[selectedIndex].el.classList.remove('selected');
+    selectedIndex = idx;
+    el.classList.add('selected');
   }
+
+  ctxOnOpen = onOpen;
+  ctxOnDelete = onDelete;
+
+  menuEl.classList.remove('hidden');
+  const rect = menuEl.getBoundingClientRect();
+  let x = e.clientX, y = e.clientY;
+  if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 4;
+  if (y + rect.height > window.innerHeight) y = window.innerHeight - rect.height - 4;
+  menuEl.style.left = Math.max(4, x) + 'px';
+  menuEl.style.top = Math.max(4, y) + 'px';
 }
 
 function moveSelection(delta) {
-  if (filtered.length === 0) return;
-  const items = document.querySelectorAll('.tab-item');
-  if (selectedIndex >= 0) items[selectedIndex]?.classList.remove('selected');
-  selectedIndex = Math.max(0, Math.min(filtered.length - 1, selectedIndex + delta));
-  const el = items[selectedIndex];
-  if (el) { el.classList.add('selected'); el.scrollIntoView({ block: 'nearest' }); }
+  if (rows.length === 0) return;
+  if (selectedIndex >= 0) rows[selectedIndex].el.classList.remove('selected');
+  selectedIndex = Math.max(0, Math.min(rows.length - 1, selectedIndex + delta));
+  const row = rows[selectedIndex];
+  row.el.classList.add('selected');
+  row.el.scrollIntoView({ block: 'nearest' });
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
   const searchEl = document.getElementById('search');
 
   // Sync theme from storage and watch OS preference changes
-  const { theme = 'dark' } = await browser.storage.local.get('theme');
+  const { theme = 'auto' } = await browser.storage.local.get('theme');
   localStorage.setItem('reopener-theme', theme);
   const mq = window.matchMedia('(prefers-color-scheme: dark)');
   const applyTheme = t => document.documentElement.setAttribute('data-theme',
@@ -214,24 +473,88 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyTheme(theme);
   mq.addEventListener('change', () => { if (theme === 'auto') applyTheme('auto'); });
 
-  const { closedTabs = [] } = await browser.storage.local.get('closedTabs');
-  allTabs = closedTabs;
-  renderResults('');
+  // Wire the right-click context menu
+  menuEl = document.getElementById('context-menu');
+  document.getElementById('ctx-open').addEventListener('click', () => {
+    hideContextMenu();
+    if (ctxOnOpen) ctxOnOpen();
+  });
+  document.getElementById('ctx-delete').addEventListener('click', () => {
+    hideContextMenu();
+    if (ctxOnDelete) ctxOnDelete();
+  });
+
+  // Wire the clear-history dropdown
+  clearMenuEl = document.getElementById('clear-menu');
+  const btnClear = document.getElementById('btn-clear');
+  const clearRecentForm = document.getElementById('clear-recent-form');
+  const clearMinutes = document.getElementById('clear-minutes');
+  btnClear.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (clearMenuEl.classList.contains('hidden')) openClearMenu(btnClear);
+    else hideClearMenu();
+  });
+  clearMenuEl.addEventListener('click', e => e.stopPropagation());
+  document.getElementById('clear-searched').addEventListener('click', () => {
+    const q = searchEl.value;
+    hideClearMenu();
+    clearSearched(q);
+  });
+  document.getElementById('clear-recent').addEventListener('click', () => {
+    clearRecentForm.classList.toggle('hidden');
+    if (!clearRecentForm.classList.contains('hidden')) clearMinutes.focus();
+  });
+  const submitRecent = () => {
+    const m = parseInt(clearMinutes.value, 10);
+    if (!m || m < 1) { clearMinutes.focus(); return; }
+    hideClearMenu();
+    clearRecent(m);
+  };
+  document.getElementById('clear-recent-go').addEventListener('click', submitRecent);
+  clearMinutes.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); submitRecent(); }
+  });
+  document.getElementById('clear-all').addEventListener('click', () => {
+    hideClearMenu();
+    clearAll();
+  });
+
+  document.addEventListener('click', hideMenus);
+  document.addEventListener('scroll', hideMenus, true);
+  window.addEventListener('blur', hideMenus);
+
+  const { closedTabs = [], expandWindows = false, expandThreshold = 10 } =
+    await browser.storage.local.get(['closedTabs', 'expandWindows', 'expandThreshold']);
+  // Normalise legacy entries (stored before window grouping existed) to tabs.
+  allEntries = closedTabs.map(e => e.type ? e : { type: 'tab', ...e });
+
+  // Default expansion: when enabled, expand windows up to the configured size.
+  if (expandWindows) {
+    allEntries.forEach(e => {
+      if (isWindow(e) && e.tabs.length <= expandThreshold) expanded.add(e);
+    });
+  }
+
+  render('');
 
   searchEl.focus();
-
-  searchEl.addEventListener('input', () => renderResults(searchEl.value));
+  searchEl.addEventListener('input', () => render(searchEl.value));
 
   searchEl.addEventListener('keydown', e => {
+    const menuOpen = (menuEl && !menuEl.classList.contains('hidden')) ||
+                     (clearMenuEl && !clearMenuEl.classList.contains('hidden'));
+    if (e.key === 'Escape' && menuOpen) {
+      e.preventDefault(); hideMenus(); return;
+    }
     if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(1); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-1); }
-    else if (e.key === 'Delete') { e.preventDefault(); deleteSelected(); }
+    else if (e.key === 'Delete') { e.preventDefault(); rows[selectedIndex]?.remove?.(); }
+    else if ((e.key === 'ArrowRight' || e.key === 'ArrowLeft') && rows[selectedIndex]?.toggle) {
+      e.preventDefault();
+      rows[selectedIndex].toggle();
+    }
     else if (e.key === 'Enter') {
-      if (selectedIndex >= 0 && filtered[selectedIndex]) {
-        openTab(filtered[selectedIndex].url);
-      } else if (filtered.length > 0) {
-        openTab(filtered[0].url);
-      }
+      if (rows[selectedIndex]) rows[selectedIndex].activate();
     }
   });
 
