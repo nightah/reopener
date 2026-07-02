@@ -34,6 +34,18 @@ Type to instantly filter by title or URL. Matching characters are highlighted an
 
 ![Fuzzy search filtering by "github"](screenshots/search.png)
 
+### Right-click menu
+
+Right-click any entry for a quick Open or Delete action.
+
+![Right-click context menu with Open and Delete](screenshots/context-menu.png)
+
+### Clearing history
+
+The trash icon opens a menu to clear everything, just the tabs matching your current search, or anything closed within the last few minutes.
+
+![Clear history dropdown menu](screenshots/clear-menu.png)
+
 ## Installation
 
 ### Firefox Add-ons (recommended)
