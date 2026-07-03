@@ -7,6 +7,9 @@ A Firefox extension that tracks every tab you close and lets you find and restor
 - **Unlimited history**: remembers up to 9,999 closed tabs by default (configurable)
 - **Fuzzy search**: search by page title or URL; results rank title matches above URL matches
 - **Window grouping**: closing a whole window is captured as one group showing its tab count, with expand/collapse. Restore the entire window in one click, or expand it and restore individual tabs
+- **Full-fidelity restore**: restoring a window prefers Firefox's own session store, bringing back tab groups, scroll position, form data, pinned/container state, and even local `file://` tabs. When the window has aged out of Firefox's session buffer, it rebuilds from stored URLs and re-creates the tab groups it captured
+- **Tab-group aware**: remembers each tab's group (name and colour), including for single tabs, and puts them back in their groups on restore
+- **Session-restore friendly**: if you quit with "restore previous session" enabled, the windows Firefox brings back are not left behind as phantom closed-window entries
 - **Right-click actions**: right-click any entry for a quick Open / Delete menu
 - **Flexible clearing**: clear all history, only the tabs matching your current search, or everything closed within the last N minutes (each confirmed first)
 - **Favicons**: displays cached favicons with Google's favicon service as a fallback
@@ -76,6 +79,10 @@ Click the **Reopener** button in the Firefox toolbar to open the popup.
 The first result is always pre-selected so you can hit Enter immediately to reopen the most recently closed tab.
 
 **Window groups**: a closed window shows as a "Window" row with its tab count and a `+` / `−` toggle. Click the toggle to expand it and see the individual tabs; click the row itself to restore the whole window (after confirming). Inside an expanded group, clicking a tab restores just that one into the current window.
+
+**How restore works**: when you restore a window, Reopener first tries to reopen it through Firefox's session store, which brings the window back exactly as it was, including tab groups, scroll position, form data, pinned/container tabs, and local `file://` pages. If the window is no longer in Firefox's session buffer (for example an older entry), Reopener rebuilds it from the stored URLs and re-creates its tab groups; in that case `file://` and other privileged pages cannot be reopened by an extension and are left in your history with a note.
+
+Restoring an **individual tab** works the same way: if the tab is still in Firefox's session buffer it is reopened natively (restoring its scroll position and form data, and working even for `file://` pages); otherwise Reopener recreates it from the stored URL and puts it back in its original group. A `file://` or privileged page that has aged out of Firefox's session buffer cannot be reopened by an extension; Reopener copies its address to your clipboard so you can paste it into the address bar (`Ctrl+L`, then `Ctrl+V` and `Enter`), and it stays in your history for reference.
 
 **Right-click** any row for an **Open** / **Delete** menu.
 
