@@ -133,16 +133,77 @@ function saveEntries() {
 }
 
 // ── Restore actions ───────────────────────────────────────
-function restoreTab(url) {
-  browser.tabs.create({ url });
+// Group descriptor for a tab inside a window group, or null if ungrouped.
+function childGroup(entry, t) {
+  if (t.groupId == null || !entry.groups) return null;
+  const meta = entry.groups[t.groupId];
+  return meta ? { id: t.groupId, ...meta } : null;
+}
+
+// Copy text to the clipboard, returning whether it worked. Uses the async
+// Clipboard API (granted by the clipboardWrite permission) with an execCommand
+// fallback for good measure.
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+// Tell the user about pages that couldn't be reopened (file:// or privileged
+// pages that Firefox won't let an extension open and that have aged out of its
+// session buffer), and put their addresses on the clipboard so they can paste
+// them into the address bar (Ctrl+L, Ctrl+V, Enter).
+async function notifyUnreopenable(urls) {
+  const n = urls.length;
+  const copied = await copyToClipboard(urls.join('\n'));
+  const lead = n === 1
+    ? `This page couldn't be reopened`
+    : `${n} pages couldn't be reopened`;
+  let hint;
+  if (copied && n === 1) {
+    hint = `Its address was copied to your clipboard. Press Ctrl+L, then Ctrl+V and Enter to open it.`;
+  } else if (copied) {
+    hint = `Their addresses were copied to your clipboard.`;
+  } else {
+    hint = `Address${n === 1 ? '' : 'es'}:\n${urls.join('\n')}`;
+  }
+  alert(`${lead}: a local file or privileged page Firefox won't let an extension ` +
+        `open, no longer in its recent-session history.\n\n${hint}\n\n` +
+        `${n === 1 ? 'It remains' : 'They remain'} in your Reopener history.`);
+}
+
+async function restoreTab(url, group) {
+  // Routed through the background so it can re-group the tab (and so a file://
+  // failure is reported rather than silently swallowed as the popup closes).
+  const res = await browser.runtime.sendMessage({ type: 'restoreTab', url, group: group || null });
+  if (res && res.failed && res.failed.length) await notifyUnreopenable(res.failed);
   window.close();
 }
 
-function restoreWindow(entry) {
-  const urls = entry.tabs.map(t => t.url);
-  const n = urls.length;
+async function restoreWindow(entry) {
+  const n = entry.tabs.length;
   if (!confirm(`Restore this window with ${n} tab${n === 1 ? '' : 's'}?`)) return;
-  browser.windows.create({ url: urls });
+  // The background script does the restore: opening the window steals focus and
+  // closes this popup, which would abort the work if it ran here. It restores
+  // natively (tab groups, scroll, form data, file:// tabs) when the window is
+  // still in Firefox's session buffer, otherwise rebuilds from stored URLs.
+  const res = await browser.runtime.sendMessage({ type: 'restoreWindow', entry });
+  if (res && res.failed && res.failed.length) await notifyUnreopenable(res.failed);
   window.close();
 }
 
@@ -156,14 +217,21 @@ async function removeEntry(entry) {
 
 async function removeChildTab(entry, childIndex) {
   entry.tabs.splice(childIndex, 1);
+  // The stored window no longer matches Firefox's session snapshot, so drop the
+  // sessionId; restore must now rebuild from our (edited) tab list.
+  delete entry.sessionId;
   if (entry.tabs.length === 1) {
-    // Collapse a one-tab window group back into a plain tab entry.
+    // Collapse a one-tab window group back into a plain tab entry, keeping the
+    // surviving tab's group membership.
     const only = entry.tabs[0];
+    const group = childGroup(entry, only);
     entry.type = 'tab';
     entry.title = only.title;
     entry.url = only.url;
     entry.favIconUrl = only.favIconUrl;
+    if (group) entry.group = group; else delete entry.group;
     delete entry.tabs;
+    delete entry.groups;
     expanded.delete(entry);
   } else if (entry.tabs.length === 0) {
     const i = allEntries.indexOf(entry);
@@ -185,9 +253,16 @@ async function clearSearched(query) {
   for (const e of allEntries) {
     if (isWindow(e)) {
       const kept = e.tabs.filter(t => fuzzyScore(q, t.title, t.url) === 0);
-      if (kept.length === e.tabs.length) next.push(e);
-      else if (kept.length === 1) next.push({ type: 'tab', ...kept[0], closedAt: e.closedAt });
-      else if (kept.length > 1) next.push({ ...e, tabs: kept });
+      if (kept.length === e.tabs.length) next.push(e);   // untouched, keep sessionId
+      else if (kept.length === 1) {
+        const only = kept[0];
+        const group = childGroup(e, only);
+        next.push({ type: 'tab', title: only.title, url: only.url,
+          favIconUrl: only.favIconUrl, closedAt: e.closedAt, ...(group && { group }) });
+      }
+      // Trimmed window: drop the sessionId so restore rebuilds our edited list
+      // rather than natively reopening the tabs the user just cleared.
+      else if (kept.length > 1) next.push({ ...e, tabs: kept, sessionId: null });
       // 0 kept → drop the group entirely
     } else if (fuzzyScore(q, e.title, e.url) === 0) {
       next.push(e);
@@ -304,7 +379,7 @@ function buildWindowRow(entry, container) {
       const item = { title: t.title, url: t.url, favIconUrl: t.favIconUrl, closedAt: entry.closedAt };
       container.appendChild(buildTabRow(item, '', {
         indented: true,
-        activate: () => restoreTab(t.url),
+        activate: () => restoreTab(t.url, childGroup(entry, t)),
         remove: () => removeChildTab(entry, ti).then(rerender),
       }));
     });
@@ -322,12 +397,12 @@ function flatten() {
     if (isWindow(entry)) {
       entry.tabs.forEach((t, ti) => out.push({
         title: t.title, url: t.url, favIconUrl: t.favIconUrl,
-        closedAt: entry.closedAt, entry, childIndex: ti,
+        closedAt: entry.closedAt, entry, childIndex: ti, group: childGroup(entry, t),
       }));
     } else {
       out.push({
         title: entry.title, url: entry.url, favIconUrl: entry.favIconUrl,
-        closedAt: entry.closedAt, entry, childIndex: -1,
+        closedAt: entry.closedAt, entry, childIndex: -1, group: entry.group || null,
       });
     }
   });
@@ -371,7 +446,7 @@ function render(query) {
         indented: false,
         fromWindow: item.childIndex >= 0,
         onWindowRestore: () => restoreWindow(item.entry),
-        activate: () => restoreTab(item.url),
+        activate: () => restoreTab(item.url, item.group),
         remove: () => (item.childIndex >= 0
           ? removeChildTab(item.entry, item.childIndex)
           : removeEntry(item.entry)).then(rerender),
@@ -387,7 +462,7 @@ function render(query) {
       } else {
         fragment.appendChild(buildTabRow(entry, '', {
           indented: false,
-          activate: () => restoreTab(entry.url),
+          activate: () => restoreTab(entry.url, entry.group),
           remove: () => removeEntry(entry).then(rerender),
         }));
       }

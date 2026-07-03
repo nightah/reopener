@@ -5,24 +5,57 @@ const DEFAULT_MAX_TABS = 9999;
 // settles (or when windows.onRemoved confirms the window is gone).
 const WINDOW_FLUSH_MS = 250;
 
-// Live tab cache: tabId -> { title, url, favIconUrl }
+// Live tab cache: tabId -> { title, url, favIconUrl, groupId }
 const tabCache = new Map();
+
+// Live tab-group metadata: groupId -> { title, color, collapsed }. Captured
+// while groups exist so we can rebuild them after a window is closed (the group
+// is gone by the time tabs.onRemoved fires).
+const groupCache = new Map();
 
 // Windows currently closing: windowId -> { tabs: [...], timer }
 const closingWindows = new Map();
+
+// The tabGroups WebExtensions API is recent; degrade gracefully if unavailable.
+const hasTabGroups = typeof browser !== 'undefined' && !!browser.tabGroups;
 
 function shouldSkip(url) {
   if (!url) return true;
   return url.startsWith('about:') || url.startsWith('moz-extension:') || url === 'chrome://newtab/';
 }
 
+// A real group id is a non-negative number; ungrouped tabs report -1 (or the
+// property is absent on older Firefox).
+function groupIdOf(tab) {
+  return (typeof tab.groupId === 'number' && tab.groupId >= 0) ? tab.groupId : null;
+}
+
+async function cacheGroup(groupId) {
+  if (!hasTabGroups || groupId == null) return;
+  try {
+    const g = await browser.tabGroups.get(groupId);
+    groupCache.set(groupId, { title: g.title || '', color: g.color, collapsed: !!g.collapsed });
+  } catch (_) { /* group may have just been removed */ }
+}
+
+// A serialisable group descriptor for a single stored tab (its original group
+// id plus the cached metadata), or null when the tab wasn't grouped. A lone tab
+// can still belong to a group, so single-tab entries carry this too.
+function groupDescriptor(groupId) {
+  if (groupId == null || !groupCache.has(groupId)) return null;
+  return { id: groupId, ...groupCache.get(groupId) };
+}
+
 function cacheTab(tab) {
   if (tab && tab.id && !shouldSkip(tab.url)) {
+    const groupId = groupIdOf(tab);
     tabCache.set(tab.id, {
       title: tab.title || tab.url,
       url: tab.url,
       favIconUrl: tab.favIconUrl && !tab.favIconUrl.startsWith('data:') ? tab.favIconUrl : null,
+      groupId,
     });
+    if (groupId != null) cacheGroup(groupId); // refresh metadata, fire-and-forget
   }
 }
 
@@ -56,7 +89,34 @@ async function pushEntry(entry) {
   await browser.storage.local.set({ closedTabs });
 }
 
-function flushWindow(windowId) {
+// Find a window still in Firefox's closed-session buffer whose tabs best match
+// the given URLs, returning its sessionId (or null). Used both to record the
+// sessionId at close time (minMatches = 1) and to re-discover it at restore time
+// for entries saved before session capture existed (a stricter minMatches, to
+// avoid restoring the wrong window). Best-effort: the buffer is small and ages
+// out, so this is often null, in which case restore rebuilds from URLs.
+async function matchClosedWindow(urls, minMatches) {
+  if (!browser.sessions || !browser.sessions.getRecentlyClosed) return null;
+  try {
+    const recent = await browser.sessions.getRecentlyClosed({ maxResults: 25 });
+    const wanted = new Set(urls);
+    let best = null, bestScore = 0;
+    for (const s of recent) {
+      const w = s.window;
+      if (!w || !w.sessionId || !Array.isArray(w.tabs)) continue;
+      // Score by how many of our URLs this closed window contains; the buffered
+      // tabs exclude about:/moz-extension: pages, so counts won't be exact.
+      let score = 0;
+      for (const t of w.tabs) if (wanted.has(t.url)) score++;
+      if (score > bestScore) { bestScore = score; best = w.sessionId; }
+    }
+    return bestScore >= minMatches ? best : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function flushWindow(windowId) {
   const buf = closingWindows.get(windowId);
   if (!buf) return;
   clearTimeout(buf.timer);
@@ -66,12 +126,26 @@ function flushWindow(windowId) {
   if (tabs.length === 0) return;
 
   const closedAt = Date.now();
-  // A window that only had one (non-skipped) tab is just a normal single close.
-  const entry = tabs.length === 1
-    ? { type: 'tab', ...tabs[0], closedAt }
-    : { type: 'window', closedAt, tabs };
 
-  enqueue(() => pushEntry(entry));
+  // A window that only had one (non-skipped) tab is just a normal single close,
+  // but it may still have been in a group, so preserve that.
+  if (tabs.length === 1) {
+    const { title, url, favIconUrl, groupId } = tabs[0];
+    const group = groupDescriptor(groupId);
+    enqueue(() => pushEntry({ type: 'tab', title, url, favIconUrl, closedAt, ...(group && { group }) }));
+    return;
+  }
+
+  // Collect the metadata for every group represented among the closed tabs.
+  const groups = {};
+  for (const t of tabs) {
+    if (t.groupId != null && groupCache.has(t.groupId) && !(t.groupId in groups)) {
+      groups[t.groupId] = groupCache.get(t.groupId);
+    }
+  }
+
+  const sessionId = await matchClosedWindow(tabs.map(t => t.url), 1);
+  enqueue(() => pushEntry({ type: 'window', closedAt, tabs, groups, sessionId }));
 }
 
 // On startup: seed the live tab cache, and pre-populate closed-tab history
@@ -88,7 +162,7 @@ async function init() {
   const seeded = [];
 
   for (const s of sessions) {
-    // lastModified is in seconds; convert to ms. Keep data: URIs — Firefox
+    // lastModified is in seconds; convert to ms. Keep data: URIs because Firefox
     // stores favicons that way in the session store, and we only seed ~25 items.
     if (s.tab && !shouldSkip(s.tab.url)) {
       seeded.push({
@@ -106,7 +180,9 @@ async function init() {
       const closedAt = (s.window.lastModified || nowSec) * 1000;
       seeded.push(wtabs.length === 1
         ? { type: 'tab', ...wtabs[0], closedAt }
-        : { type: 'window', closedAt, tabs: wtabs });
+        // Keep Firefox's sessionId so these can still be restored natively (with
+        // groups etc.) while they remain in the session buffer.
+        : { type: 'window', closedAt, tabs: wtabs, sessionId: s.window.sessionId || null });
     }
   }
 
@@ -117,6 +193,279 @@ async function init() {
 
 init();
 
+// Restore a closed window. Done in the background (not the popup) because
+// opening the new window steals focus and closes the popup, which would abort a
+// multi-step restore.
+//
+// Two strategies, best first:
+//   1. Native session restore: if we recorded Firefox's sessionId and it's
+//      still in the closed-session buffer, browser.sessions.restore() brings the
+//      window back with FULL fidelity: tab groups, scroll position, form data,
+//      pinned/container state, and even file:// tabs (native restore isn't
+//      subject to the extension API's URL restrictions).
+//   2. URL rebuild: reconstruct the window from stored URLs and re-create the
+//      tab groups we captured. This is the only option for windows that have
+//      aged out of the session buffer, but it CANNOT reopen file:// (or other
+//      privileged) tabs: Firefox refuses to let an extension navigate to them,
+//      so those are reported back as `failed` and remain in history.
+async function restoreWindowEntry(entry) {
+  if (browser.sessions && browser.sessions.restore) {
+    // Prefer the sessionId captured at close; otherwise try to re-discover the
+    // window in Firefox's closed-session buffer (helps entries saved before
+    // session capture existed, e.g. your current 59-tab window). Require a
+    // strong URL match there so we don't restore an unrelated window.
+    let sessionId = entry && entry.sessionId;
+    if (!sessionId && entry && Array.isArray(entry.tabs)) {
+      const urls = entry.tabs.map(t => t.url);
+      sessionId = await matchClosedWindow(urls, Math.max(2, Math.ceil(urls.length * 0.7)));
+    }
+    if (sessionId) {
+      try {
+        await browser.sessions.restore(sessionId);
+        return { via: 'session', failed: [] };
+      } catch (_) {
+        // Aged out of the session buffer; fall through to a URL rebuild.
+      }
+    }
+  }
+  return rebuildWindow(entry);
+}
+
+async function rebuildWindow(entry) {
+  const tabs = entry.tabs || [];
+  const items = tabs.map((t, index) => ({ ...t, index }));
+  // http/https URLs go in one fast, native windows.create batch. Anything else
+  // (file://, about:, moz-extension:, …) is opened separately: the batch form
+  // rejects the *entire* window if a single URL is one it won't accept.
+  const batch = items.filter(it => /^https?:\/\//i.test(it.url));
+  const deferred = items.filter(it => !/^https?:\/\//i.test(it.url));
+
+  const win = batch.length
+    ? await browser.windows.create({ url: batch.map(it => it.url) })
+    : await browser.windows.create({});
+  // Only an empty (no-batch) window carries a placeholder new-tab to clean up.
+  const blankTabId = batch.length ? null : (win.tabs && win.tabs[0] && win.tabs[0].id);
+
+  // Track created tabs so we can regroup them. Batch tabs come back in url order.
+  const created = [];
+  if (batch.length && win.tabs) {
+    win.tabs.forEach((tab, i) => {
+      if (batch[i]) created.push({ tabId: tab.id, groupId: batch[i].groupId ?? null, index: batch[i].index });
+    });
+  }
+
+  const failed = [];
+  for (const it of deferred.sort((a, b) => a.index - b.index)) {
+    try {
+      const tab = await browser.tabs.create({ windowId: win.id, url: it.url, index: it.index, active: false });
+      created.push({ tabId: tab.id, groupId: it.groupId ?? null, index: it.index });
+    } catch (err) {
+      console.warn('Reopener: could not reopen', it.url, err && err.message);
+      failed.push(it.url);
+    }
+  }
+
+  // Remove the placeholder, but not if it's the only tab (Firefox closes an
+  // empty window).
+  if (blankTabId != null && failed.length < tabs.length) {
+    await browser.tabs.remove(blankTabId).catch(() => {});
+  }
+
+  await rebuildGroups(win.id, created, entry.groups || {});
+  return { via: 'rebuild', failed };
+}
+
+// Put restored tabs into a group. Rejoins the original group if it still exists
+// (e.g. a single tab reopened into the very window it was closed from); failing
+// that, creates a fresh group with the saved title/colour. Best-effort.
+async function attachToGroup(windowId, tabIds, origGroupId, meta) {
+  if (!hasTabGroups || !browser.tabs.group || !tabIds.length) return;
+
+  if (origGroupId != null) {
+    try {
+      // Rejoin the original group only if it still exists in this same window;
+      // grouping into a group in another window would drag the tab over there.
+      const g = await browser.tabGroups.get(origGroupId);
+      if (g && g.windowId === windowId) {
+        await browser.tabs.group({ tabIds, groupId: origGroupId });
+        return; // rejoined the original group, keeping its own title/colour
+      }
+    } catch (_) { /* group is gone; fall through and make a new one */ }
+  }
+
+  try {
+    const newGroupId = await browser.tabs.group({ tabIds, createProperties: { windowId } });
+    if (meta) {
+      await browser.tabGroups.update(newGroupId, {
+        title: meta.title || '',
+        color: meta.color,
+        collapsed: !!meta.collapsed,
+      });
+    }
+  } catch (err) {
+    console.warn('Reopener: could not group restored tabs', err && err.message);
+  }
+}
+
+// Re-create every captured group in a rebuilt window. Best-effort: does nothing
+// if the tabGroups API is unavailable or the entry predates group capture.
+async function rebuildGroups(windowId, created, groups) {
+  // Bucket restored tabs by their original group id, preserving tab order.
+  const byGroup = new Map();
+  for (const c of created.slice().sort((a, b) => a.index - b.index)) {
+    if (c.groupId == null) continue;
+    if (!byGroup.has(c.groupId)) byGroup.set(c.groupId, []);
+    byGroup.get(c.groupId).push(c.tabId);
+  }
+  for (const [origGroupId, tabIds] of byGroup) {
+    // The window is freshly created, so the original group never still exists
+    // here; pass null so a new group is always made with the stored metadata.
+    await attachToGroup(windowId, tabIds, null, groups[origGroupId]);
+  }
+}
+
+// Reopen a closed tab natively from Firefox's session buffer, matching by URL.
+// Native restore isn't bound by the extension API's URL restrictions, so this
+// can bring back file:// and other privileged pages. Returns whether it worked
+// (false if sessions are unavailable or the tab has aged out of the buffer).
+async function restoreTabFromSession(url) {
+  if (!browser.sessions || !browser.sessions.getRecentlyClosed || !browser.sessions.restore) {
+    return false;
+  }
+  try {
+    const recent = await browser.sessions.getRecentlyClosed({ maxResults: 25 });
+    const match = recent.find(s => s.tab && s.tab.sessionId && s.tab.url === url);
+    if (!match) return false;
+    await browser.sessions.restore(match.tab.sessionId);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Restore a single closed tab, re-grouping it if it was in a group.
+async function restoreTabEntry({ url, group }) {
+  // Prefer Firefox's native restore whenever the tab is still in the session
+  // buffer: it brings the tab back with its scroll position and form data (and
+  // works for file:// and other privileged pages too). It reopens in the tab's
+  // original window.
+  if (await restoreTabFromSession(url)) return { failed: [] };
+
+  // Aged out of the buffer; rebuild it ourselves. Only http/https can be opened
+  // via the API; file:// and privileged pages have no fallback.
+  if (!/^https?:\/\//i.test(url)) {
+    console.warn('Reopener: could not reopen', url, '(unopenable and not in session buffer)');
+    return { failed: [url] };
+  }
+  let tab;
+  try {
+    tab = await browser.tabs.create({ url });
+  } catch (err) {
+    console.warn('Reopener: could not reopen', url, err && err.message);
+    return { failed: [url] };
+  }
+  if (group) await attachToGroup(tab.windowId, [tab.id], group.id ?? null, group);
+  return { failed: [] };
+}
+
+browser.runtime.onMessage.addListener((msg) => {
+  if (!msg) return;
+  if (msg.type === 'restoreWindow') return restoreWindowEntry(msg.entry);
+  if (msg.type === 'restoreTab') return restoreTabEntry(msg);
+});
+
+// ── Reconcile "restore previous session" ───────────────────────────────────
+// With that setting on, quitting Firefox closes every window (which we capture)
+// and relaunching reopens them, so the shutdown captures are phantom entries
+// for windows that were never really closed. There's no shutdown event for a
+// persistent background script, so instead we reconcile when the background
+// loads: wait for any session restore to settle, then drop the just-captured
+// window entries that match a window that is currently open.
+//
+// Running on load (rather than only runtime.onStartup) is both correct and
+// covers temporarily-loaded add-ons, which aren't running at browser launch and
+// so never get onStartup: re-adding one after a relaunch triggers this instead.
+// It's safe to run on every load because we only ever delete a *closed*-window
+// entry when a matching window is *currently open*, which, outside a session
+// restore, never happens (a window you closed isn't also open).
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function openUrlSet(win) {
+  return new Set((win.tabs || []).map(t => t.url).filter(u => !shouldSkip(u)));
+}
+
+// Poll until the open-tab count stops changing (session restore has settled),
+// then return each window's set of restorable URLs.
+async function snapshotRestoredWindows() {
+  let prevCount = -1, stableTicks = 0;
+  for (let i = 0; i < 20; i++) {
+    const wins = await browser.windows.getAll({ populate: true });
+    const count = wins.reduce((n, w) => n + (w.tabs ? w.tabs.length : 0), 0);
+    if (count === prevCount) {
+      if (++stableTicks >= 2) return wins.map(openUrlSet);
+    } else {
+      stableTicks = 0;
+      prevCount = count;
+    }
+    await delay(500);
+  }
+  const wins = await browser.windows.getAll({ populate: true });
+  return wins.map(openUrlSet);
+}
+
+// Does a captured window entry correspond to this restored window's URLs? Nearly
+// all of the entry's tabs must be present and the open window must not be much
+// bigger (i.e. the same window, not a superset that merely contains them).
+function windowMatches(entry, openSet) {
+  const urls = entry.tabs.map(t => t.url).filter(u => !shouldSkip(u));
+  if (urls.length === 0) return false;
+  let matched = 0;
+  for (const u of urls) if (openSet.has(u)) matched++;
+  return matched >= Math.ceil(urls.length * 0.8) && openSet.size <= urls.length + 3;
+}
+
+async function pruneRestoredWindows(openSets) {
+  const { closedTabs = [] } = await browser.storage.local.get('closedTabs');
+  const windowEntries = closedTabs.filter(e => e.type === 'window');
+  if (windowEntries.length === 0) return;
+
+  // Only touch the final shutdown burst: entries closed at essentially the same
+  // moment as the most recent window entry. This protects windows genuinely
+  // closed earlier that happen to share URLs with a restored one.
+  const shutdownAt = windowEntries.reduce((m, e) => Math.max(m, e.closedAt), 0);
+  const BURST_MS = 5000;
+
+  const remaining = openSets.slice();
+  const drop = new Set();
+  for (const entry of closedTabs) {
+    if (entry.type !== 'window' || shutdownAt - entry.closedAt > BURST_MS) continue;
+    const idx = remaining.findIndex(set => windowMatches(entry, set));
+    if (idx !== -1) {
+      remaining.splice(idx, 1);   // each restored window accounts for one entry
+      drop.add(entry);
+    }
+  }
+
+  if (drop.size > 0) {
+    await browser.storage.local.set({ closedTabs: closedTabs.filter(e => !drop.has(e)) });
+  }
+}
+
+async function reconcileRestoredSession() {
+  try {
+    const { closedTabs = [] } = await browser.storage.local.get('closedTabs');
+    if (!closedTabs.some(e => e.type === 'window')) return; // nothing prunable
+    const openSets = await snapshotRestoredWindows();
+    await enqueue(() => pruneRestoredWindows(openSets));
+  } catch (err) {
+    console.error('Reopener:', err);
+  }
+}
+
+reconcileRestoredSession();
+
 browser.tabs.onCreated.addListener(cacheTab);
 browser.tabs.onUpdated.addListener((_id, _info, tab) => cacheTab(tab));
 
@@ -126,7 +475,7 @@ browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
 
   if (!info || shouldSkip(info.url)) return;
 
-  const record = { title: info.title, url: info.url, favIconUrl: info.favIconUrl };
+  const record = { title: info.title, url: info.url, favIconUrl: info.favIconUrl, groupId: info.groupId ?? null };
 
   if (removeInfo.isWindowClosing) {
     // Buffer tabs from the same closing window into one group.
@@ -139,10 +488,12 @@ browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
     clearTimeout(buf.timer);
     buf.timer = setTimeout(() => flushWindow(removeInfo.windowId), WINDOW_FLUSH_MS);
   } else {
-    enqueue(() => pushEntry({ type: 'tab', ...record, closedAt: Date.now() }));
+    const { title, url, favIconUrl, groupId } = record;
+    const group = groupDescriptor(groupId);
+    enqueue(() => pushEntry({ type: 'tab', title, url, favIconUrl, closedAt: Date.now(), ...(group && { group }) }));
   }
 });
 
-// windows.onRemoved confirms a window is fully gone — flush immediately rather
+// windows.onRemoved confirms a window is fully gone, so flush immediately rather
 // than waiting on the debounce timer.
 browser.windows.onRemoved.addListener(flushWindow);
