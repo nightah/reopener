@@ -12,8 +12,13 @@
   --hover: #313244;
   --url-color: #a6e3a1;
   --time-color: #f38ba8;
+  --private: #cba6f7;
+  --private-bg: rgba(203, 166, 247, 0.16);
   --radius: 8px;
-  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  /* SF Pro on macOS / Segoe on Windows; on Linux prefer widely-shipped
+     humanist sans that read closest to SF (Noto Sans is the most universal,
+     then GNOME's Cantarell, then the near-ubiquitous DejaVu Sans). */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "Cantarell", "DejaVu Sans", sans-serif;
   --scrollbar: #45475a;
   --header-top: #252538;
   --search-area: #1a1a2a;
@@ -33,6 +38,8 @@
   --hover: #dce0e8;
   --url-color: #40a02b;
   --time-color: #d20f39;
+  --private: #8839ef;
+  --private-bg: rgba(136, 57, 239, 0.12);
   --scrollbar: #bcc0cc;
   --header-top: #e6e9ef;
   --search-area: #e6e9ef;
@@ -41,7 +48,7 @@
 }
 
 body {
-  width: 520px;
+  width: 640px;
   max-height: 600px;
   background: var(--bg);
   color: var(--text);
@@ -257,6 +264,20 @@ body {
   background: var(--border);
 }
 
+/* Non-interactive badge marking an entry closed from a private window */
+.private-badge {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--private);
+  background: var(--private-bg);
+  border-radius: 10px;
+  padding: 2px 7px;
+  cursor: default;
+}
+
 /* Indented tabs inside an expanded window group */
 .child-tab { padding-left: 40px; }
 .child-tab::before {
@@ -312,6 +333,7 @@ mark {
 }
 .popup-menu > button:hover { background: var(--hover); }
 .popup-menu > button.danger { color: var(--time-color); }
+.popup-menu > button#clear-private { color: var(--private); }
 .popup-menu > button:disabled { opacity: 0.4; cursor: default; }
 .popup-menu > button:disabled:hover { background: none; }
 
