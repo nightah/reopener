@@ -21,6 +21,10 @@ let ctxOnDelete = null;
 // Clear-history dropdown
 let clearMenuEl = null;
 
+// Whether the add-on is allowed to run in private windows. Cached at load; used
+// to decide whether the "Clear all private history" option is worth showing.
+let privateAllowed = false;
+
 function isWindow(entry) {
   return entry && entry.type === 'window';
 }
@@ -100,6 +104,18 @@ function makeWindowBadgeEl(onClick) {
     e.stopPropagation();   // don't trigger the row's single-tab restore
     onClick();
   });
+  return span;
+}
+
+// A non-interactive pill marking an entry that came from a private window,
+// mirroring the "Window" badge. Firefox calls this "Private" browsing.
+function makePrivateBadgeEl() {
+  const span = document.createElement('span');
+  span.className = 'private-badge';
+  span.title = 'Closed from a private window';
+  // Domino-mask glyph
+  span.appendChild(svgEl(10, 'M8 3C4 3 1.5 4.5 1 6.5c-.3 1.2.2 2.4 1.3 3.1 1 .7 2.3.9 3.3.4.9-.4 1.4-1.2 2.4-1.2s1.5.8 2.4 1.2c1 .5 2.3.3 3.3-.4 1.1-.7 1.6-1.9 1.3-3.1C14.5 4.5 12 3 8 3zM5 8.2a1.3 1.3 0 110-2.6 1.3 1.3 0 010 2.6zm6 0a1.3 1.3 0 110-2.6 1.3 1.3 0 010 2.6z'));
+  span.appendChild(document.createTextNode('Private'));
   return span;
 }
 
@@ -187,10 +203,10 @@ async function notifyUnreopenable(urls) {
         `${n === 1 ? 'It remains' : 'They remain'} in your Reopener history.`);
 }
 
-async function restoreTab(url, group) {
+async function restoreTab(url, group, isPrivate) {
   // Routed through the background so it can re-group the tab (and so a file://
   // failure is reported rather than silently swallowed as the popup closes).
-  const res = await browser.runtime.sendMessage({ type: 'restoreTab', url, group: group || null });
+  const res = await browser.runtime.sendMessage({ type: 'restoreTab', url, group: group || null, private: !!isPrivate });
   if (res && res.failed && res.failed.length) await notifyUnreopenable(res.failed);
   window.close();
 }
@@ -258,7 +274,8 @@ async function clearSearched(query) {
         const only = kept[0];
         const group = childGroup(e, only);
         next.push({ type: 'tab', title: only.title, url: only.url,
-          favIconUrl: only.favIconUrl, closedAt: e.closedAt, ...(group && { group }) });
+          favIconUrl: only.favIconUrl, closedAt: e.closedAt, ...(group && { group }),
+          ...(e.private && { private: true }) });
       }
       // Trimmed window: drop the sessionId so restore rebuilds our edited list
       // rather than natively reopening the tabs the user just cleared.
@@ -294,6 +311,17 @@ async function clearAll() {
   rerender();
 }
 
+async function clearPrivate() {
+  // A window is uniformly private, so the entry-level flag covers both plain
+  // private tabs and private window groups.
+  const removedTabs = allEntries.filter(e => e.private).reduce((n, e) => n + tabCount(e), 0);
+  if (removedTabs === 0) { alert('No private tabs in history.'); return; }
+  if (!confirm(`Clear ${removedTabs} private tab${removedTabs === 1 ? '' : 's'} from history?`)) return;
+  allEntries = allEntries.filter(e => !e.private);
+  await saveEntries();
+  rerender();
+}
+
 // ── Row builders ──────────────────────────────────────────
 function buildTabRow(item, query, { indented, activate, remove, fromWindow, onWindowRestore }) {
   const el = document.createElement('div');
@@ -315,6 +343,7 @@ function buildTabRow(item, query, { indented, activate, remove, fromWindow, onWi
   body.appendChild(urlEl);
   el.appendChild(body);
 
+  if (item.private) el.appendChild(makePrivateBadgeEl());
   if (fromWindow) el.appendChild(makeWindowBadgeEl(onWindowRestore));
 
   const timeEl = document.createElement('span');
@@ -355,6 +384,8 @@ function buildWindowRow(entry, container) {
   body.appendChild(subEl);
   el.appendChild(body);
 
+  if (entry.private) el.appendChild(makePrivateBadgeEl());
+
   const timeEl = document.createElement('span');
   timeEl.className = 'tab-time';
   timeEl.textContent = relativeTime(entry.closedAt);
@@ -379,7 +410,7 @@ function buildWindowRow(entry, container) {
       const item = { title: t.title, url: t.url, favIconUrl: t.favIconUrl, closedAt: entry.closedAt };
       container.appendChild(buildTabRow(item, '', {
         indented: true,
-        activate: () => restoreTab(t.url, childGroup(entry, t)),
+        activate: () => restoreTab(t.url, childGroup(entry, t), entry.private),
         remove: () => removeChildTab(entry, ti).then(rerender),
       }));
     });
@@ -398,11 +429,13 @@ function flatten() {
       entry.tabs.forEach((t, ti) => out.push({
         title: t.title, url: t.url, favIconUrl: t.favIconUrl,
         closedAt: entry.closedAt, entry, childIndex: ti, group: childGroup(entry, t),
+        private: !!entry.private,
       }));
     } else {
       out.push({
         title: entry.title, url: entry.url, favIconUrl: entry.favIconUrl,
         closedAt: entry.closedAt, entry, childIndex: -1, group: entry.group || null,
+        private: !!entry.private,
       });
     }
   });
@@ -446,7 +479,7 @@ function render(query) {
         indented: false,
         fromWindow: item.childIndex >= 0,
         onWindowRestore: () => restoreWindow(item.entry),
-        activate: () => restoreTab(item.url, item.group),
+        activate: () => restoreTab(item.url, item.group, item.private),
         remove: () => (item.childIndex >= 0
           ? removeChildTab(item.entry, item.childIndex)
           : removeEntry(item.entry)).then(rerender),
@@ -462,7 +495,7 @@ function render(query) {
       } else {
         fragment.appendChild(buildTabRow(entry, '', {
           indented: false,
-          activate: () => restoreTab(entry.url, entry.group),
+          activate: () => restoreTab(entry.url, entry.group, entry.private),
           remove: () => removeEntry(entry).then(rerender),
         }));
       }
@@ -494,6 +527,10 @@ function openClearMenu(btn) {
   hideContextMenu();
   // "Clear searched" only makes sense with an active query.
   document.getElementById('clear-searched').disabled = !document.getElementById('search').value.trim();
+  // "Clear all private history" only makes sense if we could have private
+  // entries: the add-on is allowed in private windows, or some are already here.
+  document.getElementById('clear-private').classList.toggle(
+    'hidden', !(privateAllowed || allEntries.some(e => e.private)));
   document.getElementById('clear-recent-form').classList.add('hidden');
   clearMenuEl.classList.remove('hidden');
   const r = btn.getBoundingClientRect();
@@ -548,6 +585,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyTheme(theme);
   mq.addEventListener('change', () => { if (theme === 'auto') applyTheme('auto'); });
 
+  // Is the add-on allowed to run in private windows? Gates the private-clear
+  // option; best-effort, defaults to false if the API is unavailable.
+  privateAllowed = await browser.extension.isAllowedIncognitoAccess().catch(() => false);
+
   // Wire the right-click context menu
   menuEl = document.getElementById('context-menu');
   document.getElementById('ctx-open').addEventListener('click', () => {
@@ -588,6 +629,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('clear-recent-go').addEventListener('click', submitRecent);
   clearMinutes.addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); submitRecent(); }
+  });
+  document.getElementById('clear-private').addEventListener('click', () => {
+    hideClearMenu();
+    clearPrivate();
   });
   document.getElementById('clear-all').addEventListener('click', () => {
     hideClearMenu();

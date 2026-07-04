@@ -9,6 +9,7 @@ A Firefox extension that tracks every tab you close and lets you find and restor
 - **Window grouping**: closing a whole window is captured as one group showing its tab count, with expand/collapse. Restore the entire window in one click, or expand it and restore individual tabs
 - **Full-fidelity restore**: restoring a window prefers Firefox's own session store, bringing back tab groups, scroll position, form data, pinned/container state, and even local `file://` tabs. When the window has aged out of Firefox's session buffer, it rebuilds from stored URLs and re-creates the tab groups it captured
 - **Tab-group aware**: remembers each tab's group (name and colour), including for single tabs, and puts them back in their groups on restore
+- **Private windows**: when you allow Reopener to run in private windows, it remembers closed private tabs and windows too, tags them with a **Private** badge, and reopens them back into a private window. A dedicated "Clear all private history" action (shown only when relevant) wipes just those
 - **Session-restore friendly**: if you quit with "restore previous session" enabled, the windows Firefox brings back are not left behind as phantom closed-window entries
 - **Right-click actions**: right-click any entry for a quick Open / Delete menu
 - **Flexible clearing**: clear all history, only the tabs matching your current search, or everything closed within the last N minutes (each confirmed first)
@@ -33,7 +34,7 @@ Closed windows appear as expandable groups (shown here collapsed and expanded).
 
 ### Search
 
-Type to instantly filter by title or URL. Matching characters are highlighted and results are counted. Search reaches into closed windows too; results that came from a window are tagged with a **Window** badge you can click to restore the whole set.
+Type to instantly filter by title or URL. Matching characters are highlighted and results are counted. Search reaches into closed windows too; results that came from a window are tagged with a **Window** badge you can click to restore the whole set. Entries closed from a private window carry a **Private** badge.
 
 ![Fuzzy search filtering by "github"](screenshots/search.png)
 
@@ -90,6 +91,7 @@ Restoring an **individual tab** works the same way: if the tab is still in Firef
 
 - **Clear searched history**: removes only the tabs matching your current search (enabled when a search is active)
 - **Clear recent**: removes everything closed within the last N minutes
+- **Clear all private history**: removes only entries closed from private windows (shown when Reopener is allowed in private windows, or any private entries exist)
 - **Clear all history**: wipes everything
 
 ## Settings
@@ -107,6 +109,8 @@ Open the settings page via the gear icon in the popup, or through `about:addons`
 ## Privacy
 
 All tab history is stored locally in `browser.storage.local` and never leaves your device.
+
+Private (incognito) tabs are only captured if you explicitly allow Reopener to run in private windows (`about:addons` → Reopener → **Run in Private Windows** → *Allow*); it is off by default. When enabled, private tabs are remembered the same way as normal ones, which means their titles and URLs persist locally after the private window closes — use **Clear all private history** to remove them.
 
 When a tab does not have a cached favicon, Reopener falls back to `https://www.google.com/s2/favicons?domain=<hostname>` to fetch one. Only the hostname (e.g. `github.com`) is sent, never the full URL, page title, or any other data.
 

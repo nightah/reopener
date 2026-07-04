@@ -54,6 +54,7 @@ function cacheTab(tab) {
       url: tab.url,
       favIconUrl: tab.favIconUrl && !tab.favIconUrl.startsWith('data:') ? tab.favIconUrl : null,
       groupId,
+      private: !!tab.incognito,
     });
     if (groupId != null) cacheGroup(groupId); // refresh metadata, fire-and-forget
   }
@@ -126,13 +127,14 @@ async function flushWindow(windowId) {
   if (tabs.length === 0) return;
 
   const closedAt = Date.now();
+  const isPrivate = !!buf.private;
 
   // A window that only had one (non-skipped) tab is just a normal single close,
   // but it may still have been in a group, so preserve that.
   if (tabs.length === 1) {
     const { title, url, favIconUrl, groupId } = tabs[0];
     const group = groupDescriptor(groupId);
-    enqueue(() => pushEntry({ type: 'tab', title, url, favIconUrl, closedAt, ...(group && { group }) }));
+    enqueue(() => pushEntry({ type: 'tab', title, url, favIconUrl, closedAt, ...(group && { group }), ...(isPrivate && { private: true }) }));
     return;
   }
 
@@ -144,8 +146,11 @@ async function flushWindow(windowId) {
     }
   }
 
-  const sessionId = await matchClosedWindow(tabs.map(t => t.url), 1);
-  enqueue(() => pushEntry({ type: 'window', closedAt, tabs, groups, sessionId }));
+  // Private windows are never in Firefox's closed-session buffer, so don't try
+  // to match one (it could only match an unrelated normal window); restore will
+  // rebuild from the stored URLs.
+  const sessionId = isPrivate ? null : await matchClosedWindow(tabs.map(t => t.url), 1);
+  enqueue(() => pushEntry({ type: 'window', closedAt, tabs, groups, sessionId, ...(isPrivate && { private: true }) }));
 }
 
 // On startup: seed the live tab cache, and pre-populate closed-tab history
@@ -209,6 +214,10 @@ init();
 //      privileged) tabs: Firefox refuses to let an extension navigate to them,
 //      so those are reported back as `failed` and remain in history.
 async function restoreWindowEntry(entry) {
+  // Private windows aren't captured in Firefox's session buffer, so there's no
+  // sessionId to restore natively — always rebuild into a fresh private window.
+  if (entry && entry.private) return rebuildWindow(entry);
+
   if (browser.sessions && browser.sessions.restore) {
     // Prefer the sessionId captured at close; otherwise try to re-discover the
     // window in Firefox's closed-session buffer (helps entries saved before
@@ -240,9 +249,19 @@ async function rebuildWindow(entry) {
   const batch = items.filter(it => /^https?:\/\//i.test(it.url));
   const deferred = items.filter(it => !/^https?:\/\//i.test(it.url));
 
-  const win = batch.length
-    ? await browser.windows.create({ url: batch.map(it => it.url) })
-    : await browser.windows.create({});
+  // Reopen a private window's tabs back into a private window. If the user has
+  // since revoked "Run in Private Windows", windows.create rejects — surface
+  // every URL as failed rather than crashing the restore.
+  const createProps = entry.private ? { incognito: true } : {};
+  let win;
+  try {
+    win = batch.length
+      ? await browser.windows.create({ ...createProps, url: batch.map(it => it.url) })
+      : await browser.windows.create({ ...createProps });
+  } catch (err) {
+    console.warn('Reopener: could not open window', err && err.message);
+    return { via: 'rebuild', failed: items.map(it => it.url) };
+  }
   // Only an empty (no-batch) window carries a placeholder new-tab to clean up.
   const blankTabId = batch.length ? null : (win.tabs && win.tabs[0] && win.tabs[0].id);
 
@@ -344,7 +363,21 @@ async function restoreTabFromSession(url) {
 }
 
 // Restore a single closed tab, re-grouping it if it was in a group.
-async function restoreTabEntry({ url, group }) {
+async function restoreTabEntry({ url, group, private: isPrivate }) {
+  // A private tab can't be recreated with browser.tabs.create (no incognito
+  // option) and was never in the session buffer, so open it in its own private
+  // window. Fails gracefully if private access has since been revoked.
+  if (isPrivate) {
+    if (!/^https?:\/\//i.test(url)) return { failed: [url] };
+    try {
+      await browser.windows.create({ incognito: true, url });
+      return { failed: [] };
+    } catch (err) {
+      console.warn('Reopener: could not reopen private tab', url, err && err.message);
+      return { failed: [url] };
+    }
+  }
+
   // Prefer Firefox's native restore whenever the tab is still in the session
   // buffer: it brings the tab back with its scroll position and form data (and
   // works for file:// and other privileged pages too). It reopens in the tab's
@@ -475,13 +508,15 @@ browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
 
   if (!info || shouldSkip(info.url)) return;
 
+  // The private flag is a window-level property (see flushWindow), so it isn't
+  // stored per child tab — only on the resulting tab/window entry.
   const record = { title: info.title, url: info.url, favIconUrl: info.favIconUrl, groupId: info.groupId ?? null };
 
   if (removeInfo.isWindowClosing) {
     // Buffer tabs from the same closing window into one group.
     let buf = closingWindows.get(removeInfo.windowId);
     if (!buf) {
-      buf = { tabs: [] };
+      buf = { tabs: [], private: !!info.private };
       closingWindows.set(removeInfo.windowId, buf);
     }
     buf.tabs.push(record);
@@ -490,7 +525,7 @@ browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
   } else {
     const { title, url, favIconUrl, groupId } = record;
     const group = groupDescriptor(groupId);
-    enqueue(() => pushEntry({ type: 'tab', title, url, favIconUrl, closedAt: Date.now(), ...(group && { group }) }));
+    enqueue(() => pushEntry({ type: 'tab', title, url, favIconUrl, closedAt: Date.now(), ...(group && { group }), ...(info.private && { private: true }) }));
   }
 });
 
