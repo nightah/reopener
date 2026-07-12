@@ -110,7 +110,7 @@ Open the settings page via the gear icon in the popup, or through `about:addons`
 
 All tab history is stored locally in `browser.storage.local` and never leaves your device.
 
-Private (incognito) tabs are only captured if you explicitly allow Reopener to run in private windows (`about:addons` → Reopener → **Run in Private Windows** → *Allow*); it is off by default. When enabled, private tabs are remembered the same way as normal ones, which means their titles and URLs persist locally after the private window closes — use **Clear all private history** to remove them.
+Private (incognito) tabs are only captured if you explicitly allow Reopener to run in private windows (`about:addons` → Reopener → **Run in Private Windows** → *Allow*); it is off by default. When enabled, private tabs are remembered the same way as normal ones, which means their titles and URLs persist locally after the private window closes, so use **Clear all private history** to remove them.
 
 When a tab does not have a cached favicon, Reopener falls back to `https://www.google.com/s2/favicons?domain=<hostname>` to fetch one. Only the hostname (e.g. `github.com`) is sent, never the full URL, page title, or any other data.
 
