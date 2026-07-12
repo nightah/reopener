@@ -6,7 +6,7 @@
  * popup builds (see ../popup.js), styled with the real ../popup.css, then
  * rendered with headless Chromium and trimmed to a framed PNG. Keeping the
  * sample data here (see the "Data" section) means the set can be extended
- * incrementally — edit the entries or add a shot, then rerun:
+ * incrementally: edit the entries or add a shot, then rerun:
  *
  *     node screenshots/generate.js
  *

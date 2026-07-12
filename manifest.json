@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Reopener",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Tracks every tab you close and lets you find them instantly. Fuzzy search by title or URL, keyboard navigate, and restore with a single click. Supports light, dark, and auto themes.",
   "author": "Amir Zarrinkafsh",
   "homepage_url": "https://github.com/nightah/reopener",

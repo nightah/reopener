@@ -215,7 +215,7 @@ init();
 //      so those are reported back as `failed` and remain in history.
 async function restoreWindowEntry(entry) {
   // Private windows aren't captured in Firefox's session buffer, so there's no
-  // sessionId to restore natively — always rebuild into a fresh private window.
+  // sessionId to restore natively, so always rebuild into a fresh private window.
   if (entry && entry.private) return rebuildWindow(entry);
 
   if (browser.sessions && browser.sessions.restore) {
@@ -250,7 +250,7 @@ async function rebuildWindow(entry) {
   const deferred = items.filter(it => !/^https?:\/\//i.test(it.url));
 
   // Reopen a private window's tabs back into a private window. If the user has
-  // since revoked "Run in Private Windows", windows.create rejects — surface
+  // since revoked "Run in Private Windows", windows.create rejects, so surface
   // every URL as failed rather than crashing the restore.
   const createProps = entry.private ? { incognito: true } : {};
   let win;
@@ -429,18 +429,25 @@ function openUrlSet(win) {
   return new Set((win.tabs || []).map(t => t.url).filter(u => !shouldSkip(u)));
 }
 
-// Poll until the open-tab count stops changing (session restore has settled),
-// then return each window's set of restorable URLs.
+// Poll until session restore stops adding windows and tabs, then return each
+// window's set of restorable URLs. Firefox replays windows one at a time, so
+// keying on the tab count alone (or settling after a single brief pause) can
+// snapshot mid-restore and miss the windows that come back last; those windows
+// then keep their phantom entries forever. To avoid that we (a) fold the window
+// count into the stability signature so a new window always resets the counter,
+// (b) never settle on the initial empty state before any tab has been restored,
+// and (c) require a longer quiet period across more ticks.
 async function snapshotRestoredWindows() {
-  let prevCount = -1, stableTicks = 0;
-  for (let i = 0; i < 20; i++) {
+  let prev = '', stableTicks = 0;
+  for (let i = 0; i < 40; i++) {
     const wins = await browser.windows.getAll({ populate: true });
-    const count = wins.reduce((n, w) => n + (w.tabs ? w.tabs.length : 0), 0);
-    if (count === prevCount) {
-      if (++stableTicks >= 2) return wins.map(openUrlSet);
+    const tabTotal = wins.reduce((n, w) => n + (w.tabs ? w.tabs.length : 0), 0);
+    const sig = wins.length + '/' + tabTotal;
+    if (sig === prev && tabTotal > 0) {
+      if (++stableTicks >= 3) return wins.map(openUrlSet);
     } else {
       stableTicks = 0;
-      prevCount = count;
+      prev = sig;
     }
     await delay(500);
   }
@@ -499,6 +506,45 @@ async function reconcileRestoredSession() {
 
 reconcileRestoredSession();
 
+// The settle-poll above can only wait so long before it must snapshot, and
+// Firefox sometimes replays the last window of a session well after the others.
+// On a real browser start (runtime.onStartup fires only then, i.e. exactly when
+// "restore previous session" is replaying windows) watch for new windows for a
+// short grace period and re-prune as each one appears, so a late-restored window
+// still clears its phantom entry. This only adds coverage: the load-time
+// reconcile above still runs on every load, including for temporarily-loaded
+// add-ons re-added after a relaunch, which never receive onStartup.
+async function pruneAgainstOpenWindows() {
+  try {
+    const { closedTabs = [] } = await browser.storage.local.get('closedTabs');
+    if (!closedTabs.some(e => e.type === 'window')) return; // nothing prunable
+    const wins = await browser.windows.getAll({ populate: true });
+    await enqueue(() => pruneRestoredWindows(wins.map(openUrlSet)));
+  } catch (err) {
+    console.error('Reopener:', err);
+  }
+}
+
+if (browser.runtime && browser.runtime.onStartup) {
+  browser.runtime.onStartup.addListener(() => {
+    let debounce = null;
+    const onCreated = () => {
+      // Debounce so a freshly-restored window's tabs have a moment to populate
+      // before we test it against the phantom entries.
+      clearTimeout(debounce);
+      debounce = setTimeout(pruneAgainstOpenWindows, 1000);
+    };
+    browser.windows.onCreated.addListener(onCreated);
+    // Once the session has had time to finish restoring, stop watching and do a
+    // final sweep for anything that landed right at the end of the grace period.
+    setTimeout(() => {
+      browser.windows.onCreated.removeListener(onCreated);
+      clearTimeout(debounce);
+      pruneAgainstOpenWindows();
+    }, 30000);
+  });
+}
+
 browser.tabs.onCreated.addListener(cacheTab);
 browser.tabs.onUpdated.addListener((_id, _info, tab) => cacheTab(tab));
 
@@ -509,7 +555,7 @@ browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
   if (!info || shouldSkip(info.url)) return;
 
   // The private flag is a window-level property (see flushWindow), so it isn't
-  // stored per child tab — only on the resulting tab/window entry.
+  // stored per child tab, only on the resulting tab/window entry.
   const record = { title: info.title, url: info.url, favIconUrl: info.favIconUrl, groupId: info.groupId ?? null };
 
   if (removeInfo.isWindowClosing) {
