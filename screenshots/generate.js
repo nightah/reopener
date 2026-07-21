@@ -4,7 +4,9 @@
  *
  * Each screenshot is a static HTML mock that reproduces the exact DOM the
  * popup builds (see ../popup.js), styled with the real ../popup.css, then
- * rendered with headless Chromium and trimmed to a framed PNG. Keeping the
+ * rendered with headless Chromium and trimmed to a framed PNG with a
+ * transparent background (only the popup card itself is opaque, so the shots
+ * sit on any page/README background). Keeping the
  * sample data here (see the "Data" section) means the set can be extended
  * incrementally: edit the entries or add a shot, then rerun:
  *
@@ -49,10 +51,6 @@ const MAGICK = resolveBin('ImageMagick', 'MAGICK', ['magick']);
 const popupCss = fs.readFileSync(path.join(REPO, 'popup.css'), 'utf8');
 const headerIcon = fs.readFileSync(path.join(REPO, 'icons/icon48.svg'), 'utf8')
   .replace('<svg ', '<svg class="header-icon" ');
-
-// Page (behind the popup) background and popup shadow, per theme.
-const PAGE_BG = { dark: '#12121e', light: '#c6cbd7' };
-const SHADOW = { dark: '0 10px 26px rgba(0,0,0,.34)', light: '0 10px 26px rgba(0,0,0,.16)' };
 
 // ── SVG glyphs (mirroring popup.js) ──────────────────────────────
 const G = {
@@ -188,13 +186,11 @@ const NON_MAC_TWEAK = process.platform === 'darwin' ? '' : `
 function page({ theme, body, extraCss = '' }) {
   return `<!DOCTYPE html><html${theme === 'light' ? ' data-theme="light"' : ''}><head><meta charset="utf-8"><style>
 ${popupCss}
-:root{ --page-bg:${PAGE_BG.dark}; }
-[data-theme="light"]{ --page-bg:${PAGE_BG.light}; }
-html,body{margin:0;}
-body{ width:auto; max-height:none; background:var(--page-bg); display:block; padding:24px; overflow:visible; }
+html,body{margin:0;background:transparent;}
+body{ width:auto; max-height:none; display:block; padding:24px; overflow:visible; }
 .popup{ width:640px; max-height:none; background:var(--bg); color:var(--text); font-family:var(--font);
   font-size:13px; display:flex; flex-direction:column; overflow:hidden; border-radius:12px;
-  border:1px solid var(--border); box-shadow:${SHADOW[theme]}; position:relative; }
+  border:1px solid var(--border); position:relative; }
 .popup #results{ max-height:none; overflow:visible; }
 .popup .popup-menu{ position:absolute; }
 ${NON_MAC_TWEAK}
@@ -228,20 +224,23 @@ try {
     const outPath = path.join(SHOTS, `${s.name}.png`);
     fs.writeFileSync(htmlPath, page(s));
     execFileSync(CHROMIUM, ['--headless', '--hide-scrollbars', '--disable-gpu',
+      '--default-background-color=00000000',
       '--force-device-scale-factor=1', '--virtual-time-budget=8000', '--window-size=720,2000',
       `--screenshot=${rawPath}`, `file://${htmlPath}`], { stdio: 'ignore' });
-    execFileSync(MAGICK, [rawPath, '-fuzz', '8%', '-trim', '+repage',
-      '-bordercolor', PAGE_BG[s.theme], '-border', '24', '-alpha', 'off', outPath]);
+    // Trim the transparent margin back to the card edge, then re-frame with a
+    // transparent border.
+    execFileSync(MAGICK, [rawPath, '-trim', '+repage',
+      '-bordercolor', 'none', '-border', '24', outPath]);
     console.log(`generated ${s.name}.png (${size(outPath)})`);
   }
-  // Fuzzy trim reacts to the fainter light shadow, so pin light to dark's exact
-  // frame (identical layout) for a matched pair in the README.
+  // Light and dark share a layout, so their trims should already agree; pin
+  // light to dark's exact frame anyway to guarantee a matched README pair.
   const darkPng = path.join(SHOTS, 'dark.png');
   const lightPng = path.join(SHOTS, 'light.png');
   if (fs.existsSync(darkPng) && fs.existsSync(lightPng)) {
     const [w, h] = size(darkPng).split('x');
-    execFileSync(MAGICK, [lightPng, '-background', PAGE_BG.light, '-gravity', 'center',
-      '-extent', `${w}x${h}`, '-alpha', 'off', lightPng]);
+    execFileSync(MAGICK, [lightPng, '-background', 'none', '-gravity', 'center',
+      '-extent', `${w}x${h}`, lightPng]);
     console.log(`normalized light.png to ${w}x${h}`);
   }
 } finally {
