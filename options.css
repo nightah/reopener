@@ -192,3 +192,46 @@ button.danger:hover { background: rgba(210,15,57,0.08); opacity: 1; }
 }
 .status.error { color: var(--danger); }
 .hidden { display: none; }
+
+/* Inline confirmation dialog (see askConfirm in options.js) */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.modal-overlay.hidden { display: none; }
+
+.modal {
+  width: 100%;
+  max-width: 420px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.modal-text {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.modal-btn { padding: 6px 14px; }
+.modal-btn:not(.danger) {
+  background: none;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.modal-btn:not(.danger):hover { background: var(--border); opacity: 1; }

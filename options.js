@@ -8,6 +8,38 @@ function showStatus(msg, isError = false) {
   setTimeout(() => el.classList.add('hidden'), 2500);
 }
 
+// Firefox no longer runs window.confirm() reliably from extension UI, so the
+// destructive action confirms inline instead. Resolves true when accepted.
+function askConfirm(message) {
+  const modal = document.getElementById('modal');
+  const okBtn = document.getElementById('modal-ok');
+  const cancelBtn = document.getElementById('modal-cancel');
+  document.getElementById('modal-text').textContent = message;
+  modal.classList.remove('hidden');
+  okBtn.focus();
+  return new Promise(resolve => {
+    const done = result => {
+      modal.classList.add('hidden');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      modal.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onKey, true);
+      resolve(result);
+    };
+    const onOk = () => done(true);
+    const onCancel = () => done(false);
+    const onBackdrop = e => { if (e.target === modal) done(false); };
+    const onKey = e => {
+      if (e.key === 'Escape') { e.preventDefault(); done(false); }
+      else if (e.key === 'Enter') { e.preventDefault(); done(true); }
+    };
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    modal.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKey, true);
+  });
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   const mq = window.matchMedia('(prefers-color-scheme: dark)');
 
@@ -78,7 +110,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.getElementById('btn-clear').addEventListener('click', async () => {
-    if (!confirm('Clear all closed tab history?')) return;
+    if (!await askConfirm('Clear all closed tab history? This cannot be undone.')) return;
     await browser.storage.local.set({ closedTabs: [] });
     showStatus('History cleared.');
   });

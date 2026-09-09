@@ -21,6 +21,10 @@ let ctxOnDelete = null;
 // Clear-history dropdown
 let clearMenuEl = null;
 
+// Inline confirm/notice dialog
+let modalEl = null;
+let modalResolve = null;
+
 // Whether the add-on is allowed to run in private windows. Cached at load; used
 // to decide whether the "Clear all private history" option is worth showing.
 let privateAllowed = false;
@@ -180,6 +184,41 @@ async function copyToClipboard(text) {
   }
 }
 
+// ── Dialogs ───────────────────────────────────────────────
+// Firefox no longer runs window.alert()/confirm() inside a browser-action
+// popup panel: the call never produces a dialog and leaves the panel
+// unresponsive until it is dismissed and reopened. Prompt in the popup itself.
+function closeModal(result) {
+  if (!modalEl) return;
+  modalEl.classList.add('hidden');
+  const resolve = modalResolve;
+  modalResolve = null;
+  document.getElementById('search').focus();
+  if (resolve) resolve(result);
+}
+
+function openModal(message, { okLabel = 'Confirm', cancel = true, danger = false } = {}) {
+  hideMenus();
+  // A dialog already up (a second activation) resolves as dismissed first.
+  if (modalResolve) closeModal(false);
+  return new Promise(resolve => {
+    modalResolve = resolve;
+    document.getElementById('modal-text').textContent = message;
+    const okBtn = document.getElementById('modal-ok');
+    const cancelBtn = document.getElementById('modal-cancel');
+    okBtn.textContent = okLabel;
+    okBtn.classList.toggle('danger', danger);
+    cancelBtn.classList.toggle('hidden', !cancel);
+    modalEl.classList.remove('hidden');
+    okBtn.focus();
+  });
+}
+
+// Replacements for confirm() and alert(); both resolve once dismissed.
+const askConfirm = (message, opts) => openModal(message, opts);
+const showNotice = message =>
+  openModal(message, { okLabel: 'OK', cancel: false }).then(() => undefined);
+
 // Tell the user about pages that couldn't be reopened (file:// or privileged
 // pages that Firefox won't let an extension open and that have aged out of its
 // session buffer), and put their addresses on the clipboard so they can paste
@@ -198,8 +237,8 @@ async function notifyUnreopenable(urls) {
   } else {
     hint = `Address${n === 1 ? '' : 'es'}:\n${urls.join('\n')}`;
   }
-  alert(`${lead}: a local file or privileged page Firefox won't let an extension ` +
-        `open, no longer in its recent-session history.\n\n${hint}\n\n` +
+  await showNotice(`${lead}: a local file or privileged page Firefox won't let an ` +
+        `extension open, no longer in its recent-session history.\n\n${hint}\n\n` +
         `${n === 1 ? 'It remains' : 'They remain'} in your Reopener history.`);
 }
 
@@ -213,7 +252,8 @@ async function restoreTab(url, group, isPrivate) {
 
 async function restoreWindow(entry) {
   const n = entry.tabs.length;
-  if (!confirm(`Restore this window with ${n} tab${n === 1 ? '' : 's'}?`)) return;
+  if (!await askConfirm(`Restore this window with ${n} tab${n === 1 ? '' : 's'}?`,
+    { okLabel: 'Restore' })) return;
   // The background script does the restore: opening the window steals focus and
   // closes this popup, which would abort the work if it ran here. It restores
   // natively (tab groups, scroll, form data, file:// tabs) when the window is
@@ -263,7 +303,8 @@ async function clearSearched(query) {
   if (!q) return;
   const matchCount = flatten().filter(it => fuzzyScore(q, it.title, it.url) > 0).length;
   if (matchCount === 0) return;
-  if (!confirm(`Clear ${matchCount} matching tab${matchCount === 1 ? '' : 's'} from history?`)) return;
+  if (!await askConfirm(`Clear ${matchCount} matching tab${matchCount === 1 ? '' : 's'} from history?`,
+    { okLabel: 'Clear', danger: true })) return;
 
   const next = [];
   for (const e of allEntries) {
@@ -296,8 +337,9 @@ async function clearRecent(minutes) {
   const removedTabs = allEntries
     .filter(e => e.closedAt >= cutoff)
     .reduce((n, e) => n + tabCount(e), 0);
-  if (removedTabs === 0) { alert('No tabs were closed in that time range.'); return; }
-  if (!confirm(`Clear ${removedTabs} tab${removedTabs === 1 ? '' : 's'} closed in the last ${minutes} minute${minutes === 1 ? '' : 's'}?`)) return;
+  if (removedTabs === 0) { await showNotice('No tabs were closed in that time range.'); return; }
+  if (!await askConfirm(`Clear ${removedTabs} tab${removedTabs === 1 ? '' : 's'} closed in the last ` +
+    `${minutes} minute${minutes === 1 ? '' : 's'}?`, { okLabel: 'Clear', danger: true })) return;
   allEntries = allEntries.filter(e => e.closedAt < cutoff);
   await saveEntries();
   rerender();
@@ -305,7 +347,8 @@ async function clearRecent(minutes) {
 
 async function clearAll() {
   if (allEntries.length === 0) return;
-  if (!confirm('Clear all closed tab history? This cannot be undone.')) return;
+  if (!await askConfirm('Clear all closed tab history? This cannot be undone.',
+    { okLabel: 'Clear all', danger: true })) return;
   allEntries = [];
   await saveEntries();
   rerender();
@@ -315,8 +358,9 @@ async function clearPrivate() {
   // A window is uniformly private, so the entry-level flag covers both plain
   // private tabs and private window groups.
   const removedTabs = allEntries.filter(e => e.private).reduce((n, e) => n + tabCount(e), 0);
-  if (removedTabs === 0) { alert('No private tabs in history.'); return; }
-  if (!confirm(`Clear ${removedTabs} private tab${removedTabs === 1 ? '' : 's'} from history?`)) return;
+  if (removedTabs === 0) { await showNotice('No private tabs in history.'); return; }
+  if (!await askConfirm(`Clear ${removedTabs} private tab${removedTabs === 1 ? '' : 's'} from history?`,
+    { okLabel: 'Clear', danger: true })) return;
   allEntries = allEntries.filter(e => !e.private);
   await saveEntries();
   rerender();
@@ -588,6 +632,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Is the add-on allowed to run in private windows? Gates the private-clear
   // option; best-effort, defaults to false if the API is unavailable.
   privateAllowed = await browser.extension.isAllowedIncognitoAccess().catch(() => false);
+
+  // Wire the inline confirm/notice dialog
+  modalEl = document.getElementById('modal');
+  document.getElementById('modal-ok').addEventListener('click', () => closeModal(true));
+  document.getElementById('modal-cancel').addEventListener('click', () => closeModal(false));
+  modalEl.addEventListener('click', e => { if (e.target === modalEl) closeModal(false); });
+  // Capture, so Enter/Escape answer the dialog rather than the list behind it.
+  document.addEventListener('keydown', e => {
+    if (!modalResolve) return;
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeModal(false); }
+    else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); closeModal(true); }
+  }, true);
 
   // Wire the right-click context menu
   menuEl = document.getElementById('context-menu');
